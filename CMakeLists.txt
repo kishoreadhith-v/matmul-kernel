@@ -17,6 +17,7 @@ find_package(CUDAToolkit REQUIRED)
 add_executable(matmul
   src/main.cu
   src/harness.cu
+  src/kernels/00_cublas.cu
   src/kernels/01_naive.cu
 )
 

@@ -11,7 +11,10 @@ make csv                   # writes results/bench.csv
 make csv CSV=results/naive_1024.csv
 make clean
 ```
-
+Option for run/csv:
+```
+--kernel <name|all>  default: all
+```
 If Ninja is ever unavailable:
 ```
 make GENERATOR="Unix Makefiles"

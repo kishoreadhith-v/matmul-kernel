@@ -9,6 +9,9 @@ struct BenchOptions {
   int warmup = 5;
   int seed = 0;
   bool verify = true;
+  bool timing = true;
+  float alpha = 1.0f;
+  float beta = 0.0f;
 };
 
 struct BenchResult {

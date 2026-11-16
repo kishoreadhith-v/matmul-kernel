@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cuda_runtime_api.h>
+#include <driver_types.h>
 #include <iomanip>
 #include <iostream>
 #include <random>
@@ -26,7 +28,7 @@ BenchResult bench_kernel(const KernelVariant& kernel, int M, int N, int K,
 
   std::vector<float> hA(a_elems);
   std::vector<float> hB(b_elems);
-  std::vector<float> hC(c_elems, 0.0f);
+  std::vector<float> hC(c_elems);
   std::vector<float> hOut(c_elems);
   std::vector<float> hRef(c_elems);
 
@@ -34,6 +36,7 @@ BenchResult bench_kernel(const KernelVariant& kernel, int M, int N, int K,
   std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
   for (float& x : hA) x = dist(rng);
   for (float& x : hB) x = dist(rng);
+  for (float& x : hC) x = dist(rng);
 
   float* dA = nullptr;
   float* dB = nullptr;
@@ -45,7 +48,7 @@ BenchResult bench_kernel(const KernelVariant& kernel, int M, int N, int K,
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dC), c_bytes));
   if (opts.verify) {
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dRef), c_bytes));
-    CUDA_CHECK(cudaMemset(dRef, 0, c_bytes));
+    CUDA_CHECK(cudaMemcpy(dRef, hC.data(), c_bytes, cudaMemcpyHostToDevice));
   }
 
   CUDA_CHECK(cudaMemcpy(dA, hA.data(), a_bytes, cudaMemcpyHostToDevice));
@@ -57,8 +60,8 @@ BenchResult bench_kernel(const KernelVariant& kernel, int M, int N, int K,
     CUBLAS_CHECK(cublasCreate(&handle));
     CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    const float alpha = opts.alpha;
+    const float beta = opts.beta;
 
     // cuBLAS is column-major. To compute row-major C = A * B, compute
     // C^T = B^T * A^T by swapping the operands and M/N.
@@ -69,7 +72,7 @@ BenchResult bench_kernel(const KernelVariant& kernel, int M, int N, int K,
                              &beta, dRef, N));
   }
 
-  GemmProblem problem{M, N, K, 1.0f, 0.0f, dA, dB, dC};
+  GemmProblem problem{M, N, K, opts.alpha, opts.beta, dA, dB, dC};
 
   kernel.launch(problem, 0);
   CUDA_CHECK(cudaGetLastError());
@@ -128,31 +131,50 @@ BenchResult bench_kernel(const KernelVariant& kernel, int M, int N, int K,
     }
   }
 
-  for (int i = 0; i < opts.warmup; ++i) {
-    kernel.launch(problem, 0);
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
+  if (opts.timing) {
+    for (int i = 0; i < opts.warmup; ++i) {
+      kernel.launch(problem, 0);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-  cudaEvent_t start;
-  cudaEvent_t stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
-  CUDA_CHECK(cudaEventRecord(start, 0));
-  for (int i = 0; i < opts.reps; ++i) {
-    kernel.launch(problem, 0);
-  }
-  CUDA_CHECK(cudaEventRecord(stop, 0));
-  CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventRecord(start, 0));
+    for (int i = 0; i < opts.reps; ++i) {
+      kernel.launch(problem, 0);
+    }
+    CUDA_CHECK(cudaEventRecord(stop, 0));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
-  float elapsed_ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
 
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 
-  if (handle != nullptr) {
-    CUBLAS_CHECK(cublasDestroy(handle));
+    if (handle != nullptr) {
+      CUBLAS_CHECK(cublasDestroy(handle));
+    }
+
+    const double avg_ms =
+        (opts.reps > 0) ? static_cast<double>(elapsed_ms) / opts.reps : 0.0;
+
+    result.min_ms = avg_ms;
+    result.median_ms = avg_ms;
+    result.mean_ms = avg_ms;
+    result.std_ms = 0.0;
+
+    const double seconds = avg_ms * 1e-3;
+    if (seconds > 0.0) {
+      if (kernel.metric == Metric::Gflops) {
+        result.value = 2.0 * M * N * K / seconds / 1e9;
+      } else if (kernel.metric == Metric::Gbps) {
+        result.value = 2.0 * c_elems * sizeof(float) / seconds / 1e9;
+      }
+    }
   }
 
   CUDA_CHECK(cudaFree(dA));
@@ -162,47 +184,49 @@ BenchResult bench_kernel(const KernelVariant& kernel, int M, int N, int K,
     CUDA_CHECK(cudaFree(dRef));
   }
 
-  const double avg_ms =
-      (opts.reps > 0) ? static_cast<double>(elapsed_ms) / opts.reps : 0.0;
-
-  result.min_ms = avg_ms;
-  result.median_ms = avg_ms;
-  result.mean_ms = avg_ms;
-  result.std_ms = 0.0;
-
-  const double seconds = avg_ms * 1e-3;
-  if (seconds > 0.0) {
-    if (kernel.metric == Metric::Gflops) {
-      result.value = 2.0 * M * N * K / seconds / 1e9;
-    } else if (kernel.metric == Metric::Gbps) {
-      result.value = 2.0 * c_elems * sizeof(float) / seconds / 1e9;
-    }
-  }
-
   const char* metric_name =
       kernel.metric == Metric::Gflops ? "gflops"
       : kernel.metric == Metric::Gbps ? "gbps"
                                       : "none";
-
-  std::printf(
-      "kernel=%-10s M=%d N=%d K=%d %s "
-      "max_abs=%.3e max_rel=%.3e "
-      "min_ms=%.6f median_ms=%.6f mean_ms=%.6f std_ms=%.6f "
-      "%s=%.2f\n",
-      kernel.name, M, N, K, result.passed ? "PASS" : "FAIL",
-      result.max_abs_err, result.max_rel_err, result.min_ms,
-      result.median_ms, result.mean_ms, result.std_ms, metric_name,
-      result.value);
+  if (opts.timing) {
+    if (opts.verify) {
+      std::printf("kernel=%-10s M=%d N=%d K=%d alpha=%.3f beta=%.3f %s "
+                  "max_abs=%.3e max_rel=%.3e "
+                  "min_ms=%.6f median_ms=%.6f mean_ms=%.6f std_ms=%.6f "
+                  "%s=%.2f\n",
+                  kernel.name, M, N, K, opts.alpha, opts.beta,
+                  result.passed ? "PASS" : "FAIL", result.max_abs_err,
+                  result.max_rel_err, result.min_ms, result.median_ms,
+                  result.mean_ms, result.std_ms, metric_name, result.value);
+    } else {
+      std::printf("kernel=%-10s M=%d N=%d K=%d alpha=%.3f beta=%.3f SKIP "
+                  "(no reference) min_ms=%.6f median_ms=%.6f mean_ms=%.6f "
+                  "std_ms=%.6f %s=%.2f\n",
+                  kernel.name, M, N, K, opts.alpha, opts.beta, result.min_ms,
+                  result.median_ms, result.mean_ms, result.std_ms, metric_name,
+                  result.value);
+    }
+  } else {
+    std::printf("[verify] kernel=%-10s M=%d N=%d K=%d alpha=%.3f beta=%.3f %s "
+                "max_abs=%.3e max_rel=%.3e\n",
+                kernel.name, M, N, K, opts.alpha, opts.beta,
+                result.passed ? "PASS" : "FAIL", result.max_abs_err,
+                result.max_rel_err);
+  }
   std::fflush(stdout);
 
-  if (csv_out != nullptr) {
-    *csv_out << "1," << kernel.name << "," << kernel.config << "," << M << ","
-             << N << "," << K << ",1,0," << opts.warmup << "," << opts.reps
-             << "," << std::setprecision(9) << result.min_ms << ","
-             << result.median_ms << "," << result.mean_ms << ","
-             << result.std_ms << "," << metric_name << "," << result.value
-             << "," << result.max_abs_err << "," << result.max_rel_err << ","
-             << (result.passed ? "true" : "false") << "\n";
+  if (csv_out != nullptr && opts.timing) {
+    *csv_out << std::setprecision(9)
+             << "1," << kernel.name << "," << kernel.config << ","
+             << M << "," << N << "," << K << ","
+             << opts.alpha << "," << opts.beta << ","
+             << opts.warmup << "," << opts.reps << ","
+             << result.min_ms << "," << result.median_ms << ","
+             << result.mean_ms << "," << result.std_ms << ","
+             << metric_name << "," << result.value << ","
+             << result.max_abs_err << "," << result.max_rel_err << ","
+             << (opts.verify ? (result.passed ? "true" : "false") : "unknown")
+             << "\n";
     csv_out->flush();
   }
 
